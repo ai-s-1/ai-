@@ -9,7 +9,7 @@ const __dirname = path.dirname(__filename);
 
 cmd({
     pattern: 'ssweb',
-    alias: ['screenshot', 'webss'],
+    alias: ['screenshot', 'ss'],
     desc: 'Take a screenshot of any website',
     category: 'tools',
     react: '📸',
