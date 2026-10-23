@@ -8,12 +8,8 @@ import path from 'node:path';
 
 const __filename = fileURLToPath(import.meta.url);
 
-// ============================================
-// NEXRAY API
-// ============================================
 const NEXRAY = "https://api.nexray.eu.cc/downloader";
 const API_TIMEOUT = 60000;
-const VIDEO_QUALITIES = ["360", "480", "720"]; // tried in this order
 
 const toSmallCaps = (text) => {
     const map = {
@@ -44,45 +40,46 @@ function getVideoId(url) {
     return null;
 }
 
-// ---- Audio link: ytmp3 first, then ytplay (search by title) as fallback ----
-async function getAudioLink(url, title) {
+// ============================================
+// API 1: ytplay  -> used ONLY by .play (search + download in one call)
+// ============================================
+async function apiYtPlay(query) {
+    try {
+        const res = await axios.get(`${NEXRAY}/ytplay`, { params: { q: query }, timeout: API_TIMEOUT });
+        if (res.data?.status && res.data?.result?.download_url) return res.data.result;
+    } catch (e) {
+        console.error("⚠️ ytplay failed:", e.message);
+    }
+    return null;
+}
+
+// ============================================
+// API 2: ytmp3 -> used by .song (audio options)
+// ============================================
+async function apiYtMp3(url) {
     try {
         const res = await axios.get(`${NEXRAY}/ytmp3`, { params: { url }, timeout: API_TIMEOUT });
-        const link = res.data?.status ? res.data?.result?.url : null;
-        if (link) return link;
+        if (res.data?.status && res.data?.result?.url) return res.data.result.url;
     } catch (e) {
         console.error("⚠️ ytmp3 failed:", e.message);
     }
-    if (title) {
-        try {
-            const res = await axios.get(`${NEXRAY}/ytplay`, { params: { q: title }, timeout: API_TIMEOUT });
-            const link = res.data?.status ? res.data?.result?.download_url : null;
-            if (link) return link;
-        } catch (e) {
-            console.error("⚠️ ytplay fallback failed:", e.message);
-        }
+    return null;
+}
+
+// ============================================
+// API 3: ytmp4 -> used by .video, .song (video options), .drama, .cartoon, .movie
+// ============================================
+async function apiYtMp4(url, quality = "360") {
+    try {
+        const res = await axios.get(`${NEXRAY}/v1/ytmp4`, { params: { url, resolusi: quality }, timeout: API_TIMEOUT });
+        if (res.data?.status && res.data?.result?.url) return res.data.result.url;
+    } catch (e) {
+        console.error("⚠️ ytmp4 failed:", e.message);
     }
     return null;
 }
 
-// ---- Video link: ytmp4 (tries several qualities) ----
-async function getVideoLink(url, qualities = VIDEO_QUALITIES) {
-    for (const q of qualities) {
-        try {
-            const res = await axios.get(`${NEXRAY}/v1/ytmp4`, {
-                params: { url, resolusi: q },
-                timeout: API_TIMEOUT
-            });
-            const link = res.data?.status ? res.data?.result?.url : null;
-            if (link) return link;
-        } catch (e) {
-            console.error(`⚠️ ytmp4 (${q}p) failed:`, e.message);
-        }
-    }
-    return null;
-}
-
-// ---- Download a remote file to a temp file (stream, low RAM) ----
+// ---- Download remote file to temp (stream), then caller sends it ----
 async function downloadToTemp(link, ext) {
     const tempFile = path.join(os.tmpdir(), `erfan_${Date.now()}_${Math.floor(Math.random() * 1e5)}.${ext}`);
     try {
@@ -112,7 +109,7 @@ function cleanup(file) {
     if (global.gc) global.gc();
 }
 
-// ---- Resolve text/URL to a yt-search video object ----
+// ---- Search with yt-search package (used by song/video/drama/cartoon/movie) ----
 async function resolveVideo(text, suffix = '') {
     const { default: yts } = await import('yt-search');
     if (text.startsWith('http://') || text.startsWith('https://')) {
@@ -127,10 +124,8 @@ async function resolveVideo(text, suffix = '') {
     return { vid: search.videos[0] };
 }
 
-// ---- Download + send audio (as audio or document) ----
-async function deliverAudio(conn, from, quoted, vid, asDocument = false) {
-    const link = await getAudioLink(vid.url, vid.title);
-    if (!link) return false;
+// ---- Send helpers (download to temp -> send -> delete) ----
+async function sendAudioFile(conn, from, quoted, link, title, asDocument = false) {
     let tempFile = null;
     try {
         tempFile = await downloadToTemp(link, 'mp3');
@@ -138,30 +133,27 @@ async function deliverAudio(conn, from, quoted, vid, asDocument = false) {
             await conn.sendMessage(from, {
                 document: { url: tempFile },
                 mimetype: "audio/mpeg",
-                fileName: `${vid.title}.mp3`,
-                caption: `📄 *${vid.title}*\n🎧 Audio Document\n\n> Powered by ERFAN-MD`
+                fileName: `${title}.mp3`,
+                caption: `📄 *${title}*\n🎧 Audio Document\n\n> Powered by ERFAN-MD`
             }, { quoted });
         } else {
             await conn.sendMessage(from, {
                 audio: { url: tempFile },
                 mimetype: "audio/mpeg",
-                fileName: `${vid.title}.mp3`,
+                fileName: `${title}.mp3`,
                 ptt: false
             }, { quoted });
         }
         return true;
     } catch (e) {
-        console.error("⚠️ Audio deliver failed:", e.message);
+        console.error("⚠️ Audio send failed:", e.message);
         return false;
     } finally {
         cleanup(tempFile);
     }
 }
 
-// ---- Download + send video (as video or document) ----
-async function deliverVideo(conn, from, quoted, vid, { asDocument = false, emoji = '🎬', qualities } = {}) {
-    const link = await getVideoLink(vid.url, qualities);
-    if (!link) return false;
+async function sendVideoFile(conn, from, quoted, link, title, { asDocument = false, emoji = '🎬' } = {}) {
     let tempFile = null;
     try {
         tempFile = await downloadToTemp(link, 'mp4');
@@ -169,18 +161,18 @@ async function deliverVideo(conn, from, quoted, vid, { asDocument = false, emoji
             await conn.sendMessage(from, {
                 document: { url: tempFile },
                 mimetype: "video/mp4",
-                fileName: `${vid.title}.mp4`,
-                caption: `📄 *${vid.title}*\n📹 Video Document\n\n> Powered by ERFAN-MD`
+                fileName: `${title}.mp4`,
+                caption: `📄 *${title}*\n📹 Video Document\n\n> Powered by ERFAN-MD`
             }, { quoted });
         } else {
             await conn.sendMessage(from, {
                 video: { url: tempFile },
-                caption: `${emoji} *${vid.title}*\n\n> Powered by ERFAN-MD`
+                caption: `${emoji} *${title}*\n\n> Powered by ERFAN-MD`
             }, { quoted });
         }
         return true;
     } catch (e) {
-        console.error("⚠️ Video deliver failed:", e.message);
+        console.error("⚠️ Video send failed:", e.message);
         return false;
     } finally {
         cleanup(tempFile);
@@ -188,12 +180,13 @@ async function deliverVideo(conn, from, quoted, vid, { asDocument = false, emoji
 }
 
 // ============================================
-// COMMAND: play (Auto Audio)
+// COMMAND: play  (NO yt-search package)
+// .play <query> -> ytplay API searches + gives MP3 -> download -> send
 // ============================================
 cmd({
     pattern: "play",
-    alias: ["audio", "mp3"],
-    desc: "Download YouTube audio",
+    alias: ["audio", "mmm"],
+    desc: "Search and download a song directly",
     category: "download",
     react: "🎧",
     filename: __filename
@@ -201,15 +194,15 @@ cmd({
     try {
         if (!text) return reply("❌ Please provide a song name\nExample: .play Shape of You");
 
-        const { vid, error } = await resolveVideo(text);
-        if (error) return reply(error);
+        const data = await apiYtPlay(text);
+        if (!data) return reply("❌ Song not found or API failed! Try again later.");
 
         await conn.sendMessage(from, {
-            image: { url: vid.thumbnail },
-            caption: `- *AUDIO DOWNLOADER 🎧*\n╭━━❐━⪼\n┇๏ *Title* - ${vid.title}\n┇๏ *Duration* - ${vid.timestamp}\n┇๏ *Views* - ${vid.views?.toLocaleString() || 'N/A'}\n┇๏ *Author* - ${vid.author?.name || 'Unknown'}\n┇๏ *Status* - Downloading...\n╰━━❑━⪼\n> Powered by ERFAN-MD`
+            image: { url: data.thumbnail },
+            caption: `- *AUDIO DOWNLOADER 🎧*\n╭━━❐━⪼\n┇๏ *Title* - ${data.title}\n┇๏ *Duration* - ${data.duration || 'N/A'}\n┇๏ *Views* - ${data.views || 'N/A'}\n┇๏ *Author* - ${data.channel || 'Unknown'}\n┇๏ *Status* - Downloading...\n╰━━❑━⪼\n> Powered by ERFAN-MD`
         }, { quoted: mek });
 
-        const ok = await deliverAudio(conn, from, mek, vid);
+        const ok = await sendAudioFile(conn, from, mek, data.download_url, data.title);
         if (!ok) return reply("❌ Download failed! Try again later.");
         await conn.sendMessage(from, { react: { text: '✅', key: m.key } });
 
@@ -221,7 +214,7 @@ cmd({
 });
 
 // ============================================
-// COMMAND: video
+// COMMAND: video  (yt-search package -> ytmp4 API)
 // ============================================
 cmd({
     pattern: "video",
@@ -242,7 +235,10 @@ cmd({
             caption: `*🎬 VIDEO DOWNLOADER*\n\n🎞️ *Title:* ${vid.title}\n📺 *Channel:* ${vid.author?.name || 'Unknown'}\n🕒 *Duration:* ${vid.timestamp}\n\n*Status:* Downloading Video...\n\n> Powered by ERFAN-MD`
         }, { quoted: mek });
 
-        const ok = await deliverVideo(conn, from, mek, vid, { emoji: '🎬' });
+        const link = await apiYtMp4(vid.url);
+        if (!link) return reply("❌ Video API failed! Try again later.");
+
+        const ok = await sendVideoFile(conn, from, mek, link, vid.title, { emoji: '🎬' });
         if (!ok) return reply("❌ Download failed! Try again later.");
         await conn.sendMessage(from, { react: { text: '✅', key: m.key } });
 
@@ -254,7 +250,7 @@ cmd({
 });
 
 // ============================================
-// COMMAND: song (Interactive - Audio/Video/AudioDoc/VideoDoc)
+// COMMAND: song  (yt-search package -> ytmp3 API for audio, ytmp4 for video options)
 // ============================================
 cmd({
     pattern: "song",
@@ -285,11 +281,7 @@ cmd({
 
 > Powered by ERFAN-MD`;
 
-        const sent = await conn.sendMessage(from, {
-            image: { url: vid.thumbnail },
-            caption
-        }, { quoted: mek });
-
+        const sent = await conn.sendMessage(from, { image: { url: vid.thumbnail }, caption }, { quoted: mek });
         const msgId = sent.key.id;
 
         const songListener = async (msgData) => {
@@ -313,14 +305,17 @@ cmd({
             const isAudio = choice === "1" || choice === "3";
             const asDocument = choice === "3" || choice === "4";
 
+            const link = isAudio ? await apiYtMp3(vid.url) : await apiYtMp4(vid.url);
+            if (!link) {
+                return await conn.sendMessage(from, { text: "❌ API failed! Try again later." }, { quoted: received });
+            }
+
             const ok = isAudio
-                ? await deliverAudio(conn, from, received, vid, asDocument)
-                : await deliverVideo(conn, from, received, vid, { asDocument });
+                ? await sendAudioFile(conn, from, received, link, vid.title, asDocument)
+                : await sendVideoFile(conn, from, received, link, vid.title, { asDocument });
 
             if (!ok) {
-                return await conn.sendMessage(from, {
-                    text: `❌ ${isAudio ? 'Audio' : 'Video'} download failed! Try again later.`
-                }, { quoted: received });
+                return await conn.sendMessage(from, { text: "❌ Download failed! Try again later." }, { quoted: received });
             }
             await conn.sendMessage(from, { react: { text: '✅', key: received.key } });
         };
@@ -336,7 +331,7 @@ cmd({
 });
 
 // ============================================
-// COMMAND: drama (Video Only - Interactive)
+// COMMAND: drama  (yt-search package -> ytmp4 API)
 // ============================================
 cmd({
     pattern: "drama",
@@ -365,11 +360,7 @@ cmd({
 
 > Powered by ERFAN-MD`;
 
-        const sent = await conn.sendMessage(from, {
-            image: { url: vid.thumbnail },
-            caption
-        }, { quoted: mek });
-
+        const sent = await conn.sendMessage(from, { image: { url: vid.thumbnail }, caption }, { quoted: mek });
         const msgId = sent.key.id;
 
         const dramaListener = async (msgData) => {
@@ -390,11 +381,14 @@ cmd({
                 }, { quoted: received });
             }
 
-            const ok = await deliverVideo(conn, from, received, vid, { asDocument: choice === "2" });
+            const link = await apiYtMp4(vid.url);
+            if (!link) {
+                return await conn.sendMessage(from, { text: "❌ Video API failed! Try again later." }, { quoted: received });
+            }
+
+            const ok = await sendVideoFile(conn, from, received, link, vid.title, { asDocument: choice === "2" });
             if (!ok) {
-                return await conn.sendMessage(from, {
-                    text: "❌ Video download failed! Try again later."
-                }, { quoted: received });
+                return await conn.sendMessage(from, { text: "❌ Download failed! Try again later." }, { quoted: received });
             }
             await conn.sendMessage(from, { react: { text: '✅', key: received.key } });
         };
@@ -410,7 +404,7 @@ cmd({
 });
 
 // ============================================
-// COMMAND: cartoon
+// COMMAND: cartoon  (yt-search package -> ytmp4 API)
 // ============================================
 cmd({
     pattern: "cartoon",
@@ -431,7 +425,10 @@ cmd({
             caption: `*🧸 CARTOON DOWNLOADER*\n\n🎞️ *Title:* ${vid.title}\n📺 *Channel:* ${vid.author?.name || 'Unknown'}\n🕒 *Duration:* ${vid.timestamp}\n\n*Status:* Downloading Cartoon...\n\n> Powered by ERFAN-MD`
         }, { quoted: mek });
 
-        const ok = await deliverVideo(conn, from, mek, vid, { emoji: '🧸' });
+        const link = await apiYtMp4(vid.url);
+        if (!link) return reply("❌ Video API failed! Try again later.");
+
+        const ok = await sendVideoFile(conn, from, mek, link, vid.title, { emoji: '🧸' });
         if (!ok) return reply("❌ Download failed! Try again later.");
         await conn.sendMessage(from, { react: { text: '✅', key: m.key } });
 
@@ -443,7 +440,7 @@ cmd({
 });
 
 // ============================================
-// COMMAND: movie (sent as document, 360p to keep size safe)
+// COMMAND: movie  (yt-search package -> ytmp4 API, sent as document)
 // ============================================
 cmd({
     pattern: "movie",
@@ -479,7 +476,10 @@ _⚡ Downloading as document..._
 > Powered by ERFAN-MD`
         }, { quoted: mek });
 
-        const ok = await deliverVideo(conn, from, mek, vid, { asDocument: true, qualities: ["360"] });
+        const link = await apiYtMp4(vid.url);
+        if (!link) return reply("❌ Video API failed! Try again later.");
+
+        const ok = await sendVideoFile(conn, from, mek, link, vid.title, { asDocument: true });
         if (!ok) return reply("❌ Failed to get the movie! Try again later.");
         await conn.sendMessage(from, { react: { text: '✅', key: mek.key } });
 
